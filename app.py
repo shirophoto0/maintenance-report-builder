@@ -1,5 +1,6 @@
 import streamlit as st
 import io
+import re
 from datetime import datetime
 
 from pptx import Presentation
@@ -22,6 +23,22 @@ TOPIC_DEFS = [
     ("Next Month Focus", ["next month", "focus", "แผนเดือนถัดไป", "เป้าหมายเดือนถัดไป"]),
 ]
 TOPIC_ORDER = [t[0] for t in TOPIC_DEFS] + ["Other / ไม่ระบุหมวด"]
+
+# Pattern ชื่อไฟล์: YYYY-MM_W{n}_{หน่วยงาน}.pptx เช่น 2026-08_W1_O21.pptx
+FNAME_PATTERN = re.compile(r"(\d{4})-(\d{2})_W(\d+)_([A-Za-z0-9]+)", re.IGNORECASE)
+
+
+def parse_filename_meta(filename: str):
+    """แกะปี/เดือน/สัปดาห์/หน่วยงานจากชื่อไฟล์ เช่น '2026-08_W1_O21.pptx'"""
+    m = FNAME_PATTERN.search(filename)
+    if not m:
+        return None
+    year, month, week, unit = m.groups()
+    try:
+        month_name = datetime(int(year), int(month), 1).strftime("%B %Y")
+    except ValueError:
+        month_name = f"{year}-{month}"
+    return {"year": year, "month": month, "week": week, "unit": unit.upper(), "month_name": month_name}
 
 
 # ============================================================
@@ -249,25 +266,20 @@ def build_html_report(title: str, period: str, sections: list) -> str:
 st.title("📋 Monthly Maintenance Highlight Builder")
 st.caption("อัปโหลด Weekly Report (PowerPoint) หลายไฟล์ → รวมเนื้อหาตามหัวข้อ → แนบภาพเอง → ได้ Monthly Report เป็น HTML")
 
-with st.sidebar:
-    st.header("⚙️ ตั้งค่า")
-    report_title = st.text_input("ชื่อรายงาน", value="Monthly Maintenance Highlight")
-    report_period = st.text_input("ช่วงเวลา (เช่น September 2026)", value=datetime.now().strftime("%B %Y"))
-    if st.button("🚪 ออกจากระบบ (ล้างรหัสผ่าน)"):
-        st.session_state["password_correct"] = False
-        st.rerun()
-
 uploaded_files = st.file_uploader(
-    "อัปโหลดไฟล์ Weekly Report (.pptx) — เลือกได้หลายไฟล์",
+    "อัปโหลดไฟล์ Weekly Report (.pptx) — เลือกได้หลายไฟล์ — ตั้งชื่อไฟล์ตาม pattern YYYY-MM_W{n}_{หน่วยงาน} "
+    "เช่น 2026-08_W1_O21.pptx จะช่วยตั้งชื่อสัปดาห์และช่วงเวลาให้อัตโนมัติ",
     type=["pptx"], accept_multiple_files=True
 )
 
 if uploaded_files:
     st.subheader("🏷️ ตั้งชื่อสัปดาห์ให้แต่ละไฟล์")
+    st.caption("ดึงจากชื่อไฟล์ให้อัตโนมัติถ้าตรง pattern — แก้ไขเองได้ถ้าต้องการ")
     week_labels = []
     cols = st.columns(min(len(uploaded_files), 4))
     for i, f in enumerate(uploaded_files):
-        default_label = f"Week {i+1}"
+        meta = parse_filename_meta(f.name)
+        default_label = f"Week {meta['week']} ({meta['unit']})" if meta else f"Week {i+1}"
         with cols[i % len(cols)]:
             label = st.text_input(f"📄 {f.name}", value=default_label, key=f"week_label_{f.name}_{i}")
         week_labels.append(label)
@@ -275,7 +287,27 @@ if uploaded_files:
     if st.button("🔍 อ่านไฟล์และดึงเนื้อหา", type="primary"):
         with st.spinner("กำลังอ่านไฟล์ PowerPoint..."):
             st.session_state["parsed_data"] = parse_pptx_files(uploaded_files, week_labels)
-        st.success("อ่านไฟล์เรียบร้อย เลื่อนลงเพื่อตรวจทานเนื้อหาและแนบภาพในแต่ละหัวข้อ")
+
+        # ดึงเดือน/ปีจากชื่อไฟล์แรกที่ match pattern มาตั้งเป็นช่วงเวลาของรายงานให้อัตโนมัติ
+        for f in uploaded_files:
+            meta = parse_filename_meta(f.name)
+            if meta:
+                st.session_state["report_period_input"] = meta["month_name"]
+                break
+
+        st.rerun()
+
+with st.sidebar:
+    st.header("⚙️ ตั้งค่า")
+    report_title = st.text_input("ชื่อรายงาน", value="Monthly Maintenance Highlight")
+    report_period = st.text_input(
+        "ช่วงเวลา (เช่น September 2026)",
+        value=st.session_state.get("report_period_input", datetime.now().strftime("%B %Y")),
+        key="report_period_input"
+    )
+    if st.button("🚪 ออกจากระบบ (ล้างรหัสผ่าน)"):
+        st.session_state["password_correct"] = False
+        st.rerun()
 
 if "parsed_data" in st.session_state:
     data = st.session_state["parsed_data"]
