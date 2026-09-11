@@ -1,11 +1,13 @@
 import streamlit as st
 import io
 import re
+import json
 import base64
 from datetime import datetime, date
 
 from pptx import Presentation
 from PIL import Image
+import anthropic
 
 # ============================================================
 # CONFIG
@@ -30,6 +32,8 @@ LABEL_MAP = {
     "possible cause": "possible_cause",
     "action": "action",
 }
+
+MODEL_ID = "claude-haiku-4-5"  # โมเดลที่เร็วและประหยัด เหมาะกับงานสรุปข้อความสั้นๆ
 
 
 def parse_filename_meta(filename: str):
@@ -280,6 +284,46 @@ def resize_image_b64(blob: bytes, max_side=1000, quality=80):
 
 
 # ============================================================
+# AI SUMMARIZATION (ข้อความล้วน ไม่มีรูปภาพ — ผู้ใช้ต้องกดปุ่มเองและใส่ API key เอง)
+# ============================================================
+
+def ai_summarize_item(tag, plant, problem_raw, action_raw, client):
+    """สรุป Problem/Action ของ 1 Tag ให้เป็นคำพูดอธิบายสั้นๆ (ไม่ใช่รวมบรรทัดดิบ)"""
+    prompt = (
+        f"คุณกำลังช่วยสรุปรายงานบำรุงรักษาอุปกรณ์ในโรงงาน\n"
+        f"อุปกรณ์: {tag} (Plant: {plant})\n\n"
+        f"ข้อมูล Problem (ดิบ ดึงมาจาก PowerPoint หลายสัปดาห์ อาจมีข้อความซ้ำหรือสั้นห้วน):\n{problem_raw}\n\n"
+        f"ข้อมูล Action (ดิบ):\n{action_raw}\n\n"
+        f"กรุณาสรุปแต่ละส่วนเป็นคำพูดอธิบายสั้นกระชับ 1-3 ประโยค ภาษาไทยทางการ "
+        f"เน้นใจความสำคัญของปัญหาและสิ่งที่ดำเนินการ ห้ามเติมข้อมูลที่ไม่มีในต้นฉบับ ห้ามเดาสาเหตุที่ไม่ได้ระบุ\n\n"
+        f'ตอบกลับเป็น JSON เท่านั้น รูปแบบ: {{"problem": "...", "action": "..."}} ห้ามมีข้อความอื่นนอกจาก JSON'
+    )
+    resp = client.messages.create(model=MODEL_ID, max_tokens=400, messages=[{"role": "user", "content": prompt}])
+    text = "".join(b.text for b in resp.content if b.type == "text").strip()
+    text = re.sub(r"^```json|```$", "", text, flags=re.MULTILINE).strip()
+    data = json.loads(text)
+    return data.get("problem", "").strip(), data.get("action", "").strip()
+
+
+def ai_write_exec_summary(period, items_data, client):
+    """เขียน Executive Summary จากข้อมูลงานทั้งหมด (โทนทางการแบบรายงานวิศวกรรม)"""
+    lines = [
+        f"- [{it['status']}] {it['tag']} ({it['plant']}): ปัญหา - {it['problem']} | ดำเนินการ - {it['action']}"
+        for it in items_data
+    ]
+    prompt = (
+        f"คุณคือวิศวกรอาวุโสฝ่ายบำรุงรักษา กำลังเขียนส่วน Executive Summary ของรายงาน "
+        f"Monthly Maintenance Highlight เดือน {period}\n\n"
+        f"ข้อมูลงานทั้งหมด:\n" + "\n".join(lines) + "\n\n"
+        f"เขียนสรุปภาษาไทย โทนทางการแบบรายงานวิศวกรรมอุตสาหกรรม 2-3 ย่อหน้าสั้น ครอบคลุมภาพรวมกิจกรรม "
+        f"งานที่เสร็จเด่น งานที่ยังดำเนินการสำคัญ และประเด็นที่ควรจับตา "
+        f"ห้ามใส่ตัวเลขหรือข้อเท็จจริงที่ไม่ได้อยู่ในข้อมูลด้านบน ตอบเป็น plain text ล้วน ไม่ต้องมีคำนำหรือคำอธิบายอื่น"
+    )
+    resp = client.messages.create(model=MODEL_ID, max_tokens=800, messages=[{"role": "user", "content": prompt}])
+    return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+
+# ============================================================
 # HTML REPORT TEMPLATE
 # ============================================================
 
@@ -444,6 +488,12 @@ with st.sidebar:
         value=st.session_state.get("report_period_input", datetime.now().strftime("%B %Y")),
         key="report_period_input"
     )
+    st.divider()
+    st.caption("สำหรับปุ่ม '🤖 สรุปด้วย AI' — ส่งเฉพาะข้อความ Problem/Action (ไม่มีรูปภาพ) ไปประมวลผล")
+    api_key = st.text_input("Anthropic API Key", type="password", key="anthropic_api_key")
+    if not api_key:
+        api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    st.divider()
     if st.button("🚪 ออกจากระบบ (ล้างรหัสผ่าน)"):
         st.session_state["password_correct"] = False
         st.rerun()
@@ -462,14 +512,64 @@ if "merged_items" in st.session_state:
                 st.text(u["text"])
                 st.divider()
 
-    st.subheader("✏️ ตรวจทานแต่ละ Tag — เลือกสถานะ Complete / Ongoing และแนบภาพ")
-
     if "item_overrides" not in st.session_state:
         st.session_state["item_overrides"] = {}
     if "item_images" not in st.session_state:
         st.session_state["item_images"] = {}
     if "item_status" not in st.session_state:
         st.session_state["item_status"] = {}
+
+    # เตรียม override ให้ทุก Tag ไว้ก่อน (เผื่อปุ่ม AI ถูกกดก่อนเปิดดูรายการใดๆ)
+    for item in merged_items:
+        st.session_state["item_overrides"].setdefault(item["key"], {
+            "plant": item["plant"], "problem": item["problem"],
+            "action": item["action"], "date_range": item["date_range"],
+        })
+
+    col_ai1, col_ai2 = st.columns([1, 3])
+    with col_ai1:
+        run_ai = st.button("🤖 สรุปด้วย AI ทั้งหมด", disabled=not api_key, type="secondary")
+    with col_ai2:
+        if not api_key:
+            st.caption("⚠️ ใส่ Anthropic API Key ที่แถบด้านซ้ายก่อน เพื่อใช้ปุ่มนี้")
+        else:
+            st.caption("จะสรุป Problem/Action ของทุก Tag ให้เป็นคำอธิบายสั้นๆ พร้อมเขียน Executive Summary ใหม่ให้อัตโนมัติ (ใช้เวลาสักครู่)")
+
+    if run_ai and api_key:
+        client = anthropic.Anthropic(api_key=api_key)
+        progress = st.progress(0.0, text="กำลังสรุปด้วย AI...")
+        items_for_exec = []
+        for i, item in enumerate(merged_items):
+            key = item["key"]
+            ov = st.session_state["item_overrides"][key]
+            try:
+                p_sum, a_sum = ai_summarize_item(item["tag"], ov["plant"], ov["problem"], ov["action"], client)
+                if p_sum:
+                    ov["problem"] = p_sum
+                    st.session_state[f"problem_{key}"] = p_sum
+                if a_sum:
+                    ov["action"] = a_sum
+                    st.session_state[f"action_{key}"] = a_sum
+            except Exception as e:
+                st.warning(f"สรุป {item['tag']} ไม่สำเร็จ ({e})")
+            status = st.session_state["item_status"].get(key, "Ongoing")
+            items_for_exec.append({
+                "tag": item["tag"], "plant": ov["plant"], "status": status,
+                "problem": ov["problem"], "action": ov["action"],
+            })
+            progress.progress((i + 1) / len(merged_items), text=f"สรุป {item['tag']} แล้ว ({i+1}/{len(merged_items)})")
+
+        try:
+            exec_new = ai_write_exec_summary(report_period, items_for_exec, client)
+            st.session_state["exec_text"] = exec_new
+            st.session_state["exec_text_area"] = exec_new
+        except Exception as e:
+            st.warning(f"เขียน Executive Summary ด้วย AI ไม่สำเร็จ ({e})")
+
+        progress.empty()
+        st.rerun()
+
+    st.subheader("✏️ ตรวจทานแต่ละ Tag — เลือกสถานะ Complete / Ongoing และแนบภาพ")
 
     final_items = []
     images_by_tag = {}
