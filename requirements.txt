@@ -1,4 +1,5 @@
 streamlit
-python-pptx
+python-pptx>=1.0
+openpyxl
 Pillow
 anthropic
