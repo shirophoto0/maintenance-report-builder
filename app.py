@@ -416,8 +416,48 @@ def split_words(s):
     return {w.strip().upper() for w in re.split(r"[,\n]", s or "") if w.strip()}
 
 
-def summarize_jobs(events, finished, cont, ready):
-    """Order เลขเดียวกันหลายวัน = งานเดียวต่อเนื่อง จนกว่าจะเจอสถานะเสร็จ (เจอแล้วปิดงาน ถ้ามีต่ออีก = งานใหม่)"""
+DEFAULT_TYPE_MAP = "1:RM, 2:CM, 3:PM, 4:PS, 5:MS, 6:IM, 91:RF"
+DEFAULT_EXCLUDE_PREFIX = "92"  # MN = Maintenance Notification จาก Operation ยังไม่ใช่ Job ที่ต้องนับ
+
+
+def parse_type_map(s):
+    """แปลงข้อความ '1:RM, 2:CM, ... , 91:RF' เป็น dict คีย์เป็น prefix ตัวเลข (string)"""
+    m = {}
+    for part in re.split(r"[,\n]", s or ""):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        k, v = part.split(":", 1)
+        k, v = k.strip(), v.strip().upper()
+        if k.isdigit() and v:
+            m[k] = v
+    return m
+
+
+def parse_prefix_set(s):
+    return {p.strip() for p in re.split(r"[,\n]", s or "") if p.strip().isdigit()}
+
+
+def order_type(order, type_map):
+    """คืน (code, matched) — เทียบ prefix 2 หลักก่อน (เช่น 91) แล้วค่อย 1 หลัก"""
+    s = str(order)
+    if s[:2] in type_map:
+        return type_map[s[:2]], True
+    if s[:1] in type_map:
+        return type_map[s[:1]], True
+    return "อื่นๆ", False
+
+
+def is_excluded(order, exclude_prefixes):
+    s = str(order)
+    return s[:2] in exclude_prefixes or s[:1] in exclude_prefixes
+
+
+def summarize_jobs(events, finished, cont, ready, type_map=None, exclude_prefixes=None):
+    """Order เลขเดียวกันหลายวัน = งานเดียวต่อเนื่อง จนกว่าจะเจอสถานะเสร็จ (เจอแล้วปิดงาน ถ้ามีต่ออีก = งานใหม่)
+    exclude_prefixes: เลขนำหน้า Order ที่ไม่ต้องนับเลย (เช่น 92 = Maintenance Notification จาก Operation)"""
+    type_map = type_map or {}
+    exclude_prefixes = exclude_prefixes or set()
     by = collections.OrderedDict()
     skipped = 0
     for e in events:
@@ -425,8 +465,12 @@ def summarize_jobs(events, finished, cont, ready):
             by.setdefault(e["order"], []).append(e)
         elif e["has_text"] and (e["eq"] or e["desc"]):
             skipped += 1
-    jobs, reopened = [], 0
+    jobs, reopened, excluded = [], 0, 0
+    unmatched_prefix = collections.Counter()
     for o, rows in by.items():
+        if is_excluded(o, exclude_prefixes):
+            excluded += 1
+            continue
         days = collections.OrderedDict()
         for r in rows:
             v = days.setdefault(r["date"], dict(st=None, eq=r["eq"], desc=r["desc"]))
@@ -445,6 +489,9 @@ def summarize_jobs(events, finished, cont, ready):
             segs.append((seg, False))
         if len(segs) > 1:
             reopened += 1
+        otype, matched = order_type(o, type_map)
+        if not matched:
+            unmatched_prefix[str(o)[:2]] += 1
         for sg, fin in segs:
             sts = [v["st"] for d, v in sg if v["st"]]
             last = sts[-1] if sts else None
@@ -457,13 +504,15 @@ def summarize_jobs(events, finished, cont, ready):
             else:
                 cat = "other"
             jobs.append(dict(order=o, start=sg[0][0], end=sg[-1][0], days=len(sg), eq=sg[-1][1]["eq"],
-                             desc=sg[-1][1]["desc"], last=last, cat=cat))
+                             desc=sg[-1][1]["desc"], last=last, cat=cat, type=otype))
     cnt = collections.Counter(j["cat"] for j in jobs)
+    by_type = collections.Counter(j["type"] for j in jobs)
     other_detail = sorted({(j["last"] or "ไม่ระบุ") for j in jobs if j["cat"] == "other"},
                           key=lambda x: (x != "ไม่ระบุ", x))
     return dict(total=len(jobs), done=cnt["done"], cont=cnt["continue"], ready=cnt["ready"], other=cnt["other"],
-                other_detail=other_detail, distinct=len(by), reopened=reopened, skipped=skipped,
-                multi=sum(1 for j in jobs if j["days"] >= 2), jobs=jobs)
+                other_detail=other_detail, distinct=len(by) - excluded, reopened=reopened, skipped=skipped,
+                excluded=excluded, multi=sum(1 for j in jobs if j["days"] >= 2), jobs=jobs,
+                by_type=by_type, unmatched_prefix=unmatched_prefix)
 
 
 # ============================================================
@@ -880,6 +929,20 @@ def slide_thanks(prs, code):
 
 
 # ---------- Monthly Job Summary ----------
+TYPE_ORDER = ["RM", "CM", "PM", "PS", "MS", "IM", "RF"]
+
+
+def combined_type_counts(units):
+    c = collections.Counter()
+    for _, u in units:
+        c.update(u["by_type"])
+    extra = sorted(k for k in c if k not in TYPE_ORDER and k != "อื่นๆ")
+    cols = [t for t in TYPE_ORDER if c.get(t)] + extra
+    if c.get("อื่นๆ"):
+        cols.append("อื่นๆ")
+    return c, (cols or ["-"])
+
+
 def slide_jobs(prs, units, date_text, month_label):
     """units: list[(ชื่อ sheet, summary dict)]"""
     s = prs.slides.add_slide(find_layout(prs, "CONTENT"))
@@ -889,43 +952,46 @@ def slide_jobs(prs, units, date_text, month_label):
     add_text(s, 0.5, 1.0, 8.5, 0.35, "%s  —  จำนวน Job ตามสถานะ" % names, size=14, color=COL["muted"])
     add_text(s, 8.83, 0.38, 4.0, 0.4, month_label, size=18, bold=True, color=COL["teal"], align="r")
     add_text(s, 8.83, 0.82, 4.0, 0.35, date_text, size=14, color=COL["muted"], align="r")
-    cy, chh = 1.55, 1.65
+    cy, chh = 1.5, 1.45
     pct = lambda a, b: int(round(100.0 * a / b)) if b else 0
     add_card(s, 0.5, cy, 3.5, chh, COL["dark"])
-    add_text(s, 0.75, cy + 0.15, 3.0, 0.28, "TOTAL JOBS", size=11, bold=True, color=COL["amber"], spc=3)
-    add_text(s, 0.75, cy + 0.42, 3.0, 0.85, str(T["total"]), size=54, bold=True, color=COL["amber"])
-    add_text(s, 0.75, cy + 1.24, 3.0, 0.3, "เสร็จแล้ว %d งาน (%d%%)" % (T["done"], pct(T["done"], T["total"])),
-             size=13, color=COL["white"])
+    add_text(s, 0.75, cy + 0.13, 3.0, 0.28, "TOTAL JOBS", size=11, bold=True, color=COL["amber"], spc=3)
+    add_text(s, 0.75, cy + 0.38, 3.0, 0.8, str(T["total"]), size=50, bold=True, color=COL["amber"])
+    add_text(s, 0.75, cy + 1.14, 3.0, 0.28, "เสร็จแล้ว %d งาน (%d%%)" % (T["done"], pct(T["done"], T["total"])),
+             size=12.5, color=COL["white"])
     n = len(units)
     avail, gap = 8.63, 0.2
     w = (avail - gap * (n - 1)) / float(n)
     for i, (name, u) in enumerate(units):
         x = 4.2 + i * (w + gap)
         add_card(s, x, cy, w, chh, COL["card"])
-        add_text(s, x + 0.25, cy + 0.15, 1.8, 0.35, name, size=20, bold=True, color=COL["teal"])
-        add_text(s, x + 0.25, cy + 0.5, 1.9, 0.8, str(u["total"]), size=44, bold=True, color=COL["dark"])
+        add_text(s, x + 0.25, cy + 0.13, 1.8, 0.32, name, size=19, bold=True, color=COL["teal"])
+        add_text(s, x + 0.25, cy + 0.46, 1.9, 0.75, str(u["total"]), size=40, bold=True, color=COL["dark"])
         if w >= 3.6:
-            add_text(s, x + 2.15, cy + 0.45, w - 2.3, 0.9,
+            add_text(s, x + 2.1, cy + 0.4, w - 2.25, 0.9,
                      [[("เสร็จแล้ว ", dict(color=COL["muted"])), ("%d%%" % pct(u["done"], u["total"]), dict(bold=True, color=COL["green"]))],
                       [("ทำต่อเนื่องหลายวัน ", dict(color=COL["muted"])), ("%d งาน" % u["multi"], dict(bold=True, color=COL["ink"]))]],
-                     size=12, space_after=4)
-        add_text(s, x + 0.25, cy + 1.28, w - 0.5, 0.28, "Order ไม่ซ้ำ %d รายการ" % u["distinct"], size=11, color=COL["muted"])
+                     size=11.5, space_after=3)
+        add_text(s, x + 0.25, cy + 1.16, w - 0.5, 0.26, "Order ไม่ซ้ำ %d รายการ" % u["distinct"], size=10.5, color=COL["muted"])
 
-    add_text(s, 0.5, 3.42, 6.4, 0.3, "สัดส่วนสถานะ Job แยกตามหน่วยงาน", size=14, bold=True, color=COL["dark"])
+    top2 = cy + chh + 0.22
+    add_text(s, 0.5, top2, 6.4, 0.28, "สัดส่วนสถานะ Job แยกตามหน่วยงาน", size=13.5, bold=True, color=COL["dark"])
     cd = CategoryChartData()
     cd.categories = [nm for nm, _ in units]
     series = [("เสร็จแล้ว", "done", COL["green"]), ("ทำงานต่อเนื่อง", "cont", COL["orange"]),
               ("พร้อมทำงาน", "ready", COL["teal"]), ("อื่น ๆ / ไม่ระบุ", "other", COL["other"])]
     for nm, k, _ in series:
         cd.add_series(nm, [u[k] for _, u in units])
-    gfr = s.shapes.add_chart(XL_CHART_TYPE.BAR_STACKED, Inches(0.4), Inches(3.75), Inches(6.6), Inches(2.6), cd)
+    chart_y = top2 + 0.33
+    chart_h = 2.05
+    gfr = s.shapes.add_chart(XL_CHART_TYPE.BAR_STACKED, Inches(0.4), Inches(chart_y), Inches(6.6), Inches(chart_h), cd)
     ch = gfr.chart
     ch.font.name = FONT
     ch.font.size = Pt(11)
     ch.has_legend = True
     ch.legend.position = XL_LEGEND_POSITION.BOTTOM
     ch.legend.include_in_layout = False
-    ch.legend.font.size = Pt(11)
+    ch.legend.font.size = Pt(10.5)
     ch.legend.font.name = FONT
     plot = ch.plots[0]
     plot.gap_width = 45
@@ -934,7 +1000,7 @@ def slide_jobs(prs, units, date_text, month_label):
     dl = plot.data_labels
     dl.number_format = "#,##0;;"
     dl.number_format_is_linked = False
-    dl.font.size = Pt(11)
+    dl.font.size = Pt(10.5)
     dl.font.bold = True
     dl.font.name = FONT
     dl.font.color.rgb = rgb(COL["white"])
@@ -944,7 +1010,7 @@ def slide_jobs(prs, units, date_text, month_label):
         ser.format.fill.fore_color.rgb = rgb(colr)
     ca, va = ch.category_axis, ch.value_axis
     ca.reverse_order = True
-    ca.tick_labels.font.size = Pt(13)
+    ca.tick_labels.font.size = Pt(12.5)
     ca.tick_labels.font.bold = True
     ca.tick_labels.font.name = FONT
     ca.has_major_gridlines = False
@@ -953,37 +1019,58 @@ def slide_jobs(prs, units, date_text, month_label):
     va.has_major_gridlines = False
 
     other_txt = " / ".join(dict.fromkeys(x for _, u in units for x in u["other_detail"])) or "-"
-    add_text(s, 7.2, 3.42, 5.6, 0.3, "สรุปจำนวน Job แยกสถานะ", size=14, bold=True, color=COL["dark"])
-    hd = lambda t, a="c": dict(text=t, size=11, bold=True, color=COL["white"], fill=COL["dark"], align=a)
+    add_text(s, 7.2, top2, 5.6, 0.28, "สรุปจำนวน Job แยกสถานะ", size=13.5, bold=True, color=COL["dark"])
+    hd = lambda t, a="c": dict(text=t, size=10.5, bold=True, color=COL["white"], fill=COL["dark"], align=a)
     data = [[hd("สถานะ", "l"), hd("ค่าใน Excel", "l")] + [hd(nm) for nm, _ in units] + [hd("รวม")]]
     defs = [("เสร็จแล้ว", "WF / COMPLETE", "done", COL["green"]), ("ทำงานต่อเนื่อง", "Continue", "cont", COL["orange"]),
             ("พร้อมทำงาน", "REDY", "ready", COL["teal"]), ("อื่น ๆ", other_txt, "other", COL["other"])]
     for i, (lab, xl, k, colr) in enumerate(defs):
         fill = "FFFFFF" if i % 2 == 0 else COL["card"]
-        row = [dict(text=lab, size=11, bold=True, color=colr, fill=fill, align="l"),
-               dict(text=xl, size=10, color=COL["muted"], fill=fill, align="l")]
+        row = [dict(text=lab, size=10.5, bold=True, color=colr, fill=fill, align="l"),
+               dict(text=xl, size=9.5, color=COL["muted"], fill=fill, align="l")]
         for _, u in units:
-            row.append(dict(text=("–" if u[k] == 0 else str(u[k])), size=11, fill=fill))
-        row.append(dict(text=str(T[k]), size=11, bold=True, fill=fill))
+            row.append(dict(text=("–" if u[k] == 0 else str(u[k])), size=10.5, fill=fill))
+        row.append(dict(text=str(T[k]), size=10.5, bold=True, fill=fill))
         data.append(row)
     tf = COL["tot"]
-    data.append([dict(text="รวม Job", size=11, bold=True, fill=tf, align="l"), dict(text="", size=11, fill=tf)] +
-                [dict(text=str(u["total"]), size=11, bold=True, fill=tf) for _, u in units] +
-                [dict(text=str(T["total"]), size=11, bold=True, fill=tf)])
+    data.append([dict(text="รวม Job", size=10.5, bold=True, fill=tf, align="l"), dict(text="", size=10.5, fill=tf)] +
+                [dict(text=str(u["total"]), size=10.5, bold=True, fill=tf) for _, u in units] +
+                [dict(text=str(T["total"]), size=10.5, bold=True, fill=tf)])
     tw = 5.63
     ncol_units = len(units)
-    cw = [1.4, 1.95] + [0.75] * ncol_units + [0.78]
+    cw = [1.4, 1.85] + [0.72] * ncol_units + [0.75]
     scale = tw / sum(cw)
     cw = [c * scale for c in cw]
-    add_table(s, 7.2, 3.8, cw, [0.36, 0.42, 0.42, 0.42, 0.55, 0.42], data, 11)
+    table_y = top2 + 0.33
+    add_table(s, 7.2, table_y, cw, [0.3, 0.36, 0.36, 0.36, 0.44, 0.36], data, 10.5)
+
+    # ---- Order Type breakdown (PM / CM / MS / ...) ----
+    type_counts, type_cols = combined_type_counts(units)
+    top3 = max(chart_y + chart_h, table_y + 0.3 + 0.36 * 3 + 0.44 + 0.36) + 0.18
+    add_text(s, 0.4, top3, 6.0, 0.26, "จำนวน Job แยกตาม Order Type", size=13.5, bold=True, color=COL["dark"])
+    hd2 = lambda t: dict(text=t, size=10.5, bold=True, color=COL["white"], fill=COL["dark"])
+    trow = [hd2("Order Type")] + [hd2(t) for t in type_cols] + [hd2("รวม")]
+    vrow = [dict(text="จำนวน Job", size=10.5, bold=True, color=COL["ink"], fill=COL["card"], align="l")]
+    for t in type_cols:
+        vrow.append(dict(text=str(type_counts.get(t, 0)), size=10.5, fill=COL["card"]))
+    vrow.append(dict(text=str(sum(type_counts.get(t, 0) for t in type_cols)), size=10.5, bold=True, fill=COL["tot"]))
+    tcw = [1.4] + [10.5 / len(type_cols)] * len(type_cols) + [0.9]
+    scale2 = 11.7 / sum(tcw)
+    tcw = [c * scale2 for c in tcw]
+    add_table(s, 0.4, top3 + 0.3, tcw, [0.3, 0.34], [trow, vrow], 10.5)
 
     skipped = ", ".join("%s %d" % (nm, u["skipped"]) for nm, u in units)
     reopened = ", ".join("%s %d" % (nm, u["reopened"]) for nm, u in units)
-    add_text(s, 0.5, 6.62, 11.2, 0.5,
+    excluded_n = sum(u["excluded"] for _, u in units)
+    excl_txt = ""
+    if excluded_n:
+        excl_txt = " · ตัด Order Notification (เลขนำหน้าที่ตั้งไม่นับ) ออก %d รายการ" % excluded_n
+    add_text(s, 0.5, top3 + 1.02, 11.2, 0.5,
              [[("หลักการนับ: ", dict(bold=True)),
                ("นับเฉพาะบรรทัดที่มีเลข Order (ไม่นับบรรทัดที่ไม่มีเลข Order: %s) · Order ซ้ำหลายวัน = 1 Job จนกว่าจะพบสถานะเสร็จ "
-                "(Order ที่กลับมาทำต่อหลังเสร็จ นับเป็น Job ใหม่: %s)" % (skipped, reopened), {})]],
-             size=9.5, color=COL["muted"])
+                "(Order ที่กลับมาทำต่อหลังเสร็จ นับเป็น Job ใหม่: %s) · Order Type แยกจากเลขนำหน้า Order no.%s"
+                % (skipped, reopened, excl_txt), {})]],
+             size=9, color=COL["muted"])
 
 
 # ---------- ประกอบทั้งไฟล์ ----------
@@ -1108,6 +1195,12 @@ def main():
         w_fin = st.text_input("สถานะ 'เสร็จแล้ว' (คั่นด้วย ,)", value="WF, COMPLETE", key="w_fin")
         w_con = st.text_input("สถานะ 'ทำงานต่อเนื่อง'", value="CONTINUE", key="w_con")
         w_rdy = st.text_input("สถานะ 'พร้อมทำงาน'", value="REDY, READY", key="w_rdy")
+        w_type = st.text_input("Order Type ตามเลขนำหน้า Order no. (รูปแบบ เลข:รหัส คั่นด้วย ,)",
+                                value=DEFAULT_TYPE_MAP, key="w_type",
+                                help="เช่น 91:RF หมายถึง Order ที่ขึ้นต้นด้วย 91 จัดเป็นประเภท RF — เช็คเลข 2 หลักก่อน แล้วค่อยเช็ค 1 หลัก")
+        w_excl = st.text_input("เลขนำหน้า Order ที่ไม่ต้องนับเลย (คั่นด้วย ,)",
+                                value=DEFAULT_EXCLUDE_PREFIX, key="w_excl",
+                                help="ค่าเริ่มต้น 92 = Maintenance Notification (MN) ที่ Operation ออกมาให้ ยังไม่ใช่ Job")
 
     if st.button("🔍 อ่านไฟล์ทั้งหมด", type="primary"):
         if not (weekly or xl or cap):
@@ -1240,14 +1333,27 @@ def main():
         st.divider()
         st.subheader("📊 Monthly Job Summary")
         fin, con, rdy = split_words(w_fin), split_words(w_con), split_words(w_rdy)
+        type_map = parse_type_map(w_type)
+        exclude_prefixes = parse_prefix_set(w_excl)
         chosen = st.multiselect("Sheet ที่ใช้นับ Job", list(events.keys()), default=list(events.keys()))
         for nm in chosen:
-            units.append((nm, summarize_jobs(events[nm], fin, con, rdy)))
+            units.append((nm, summarize_jobs(events[nm], fin, con, rdy, type_map, exclude_prefixes)))
         if units:
             rows = [{"Sheet": nm, "รวม Job": u["total"], "เสร็จแล้ว": u["done"], "ต่อเนื่อง": u["cont"], "พร้อมทำงาน": u["ready"],
                      "อื่น ๆ": u["other"], "Order ไม่ซ้ำ": u["distinct"], "บรรทัดไม่มี Order (ไม่นับ)": u["skipped"],
-                     "Order ที่กลับมาทำต่อหลังเสร็จ": u["reopened"]} for nm, u in units]
+                     "ตัดออก (Notification)": u["excluded"], "Order ที่กลับมาทำต่อหลังเสร็จ": u["reopened"]} for nm, u in units]
             st.dataframe(rows, hide_index=True, use_container_width=True)
+
+            tcounts, tcols = combined_type_counts(units)
+            st.caption("จำนวน Job แยกตาม Order Type (รวมทุก Sheet ที่เลือก)")
+            st.dataframe([{**{"": "จำนวน Job"}, **{t: tcounts.get(t, 0) for t in tcols}}], hide_index=True, use_container_width=True)
+            unmapped = collections.Counter()
+            for _, u in units:
+                unmapped.update(u["unmatched_prefix"])
+            if unmapped:
+                st.warning("พบ Order ที่เลขนำหน้าไม่มีใน mapping (%d รายการ): %s — เข้ากลุ่ม 'อื่นๆ' ถ้าทราบว่าคือประเภทไหน เพิ่มลงในช่อง 'Order Type ตามเลขนำหน้า' ด้านบนได้เลย"
+                          % (sum(unmapped.values()), ", ".join("%s×%d" % (k, v) for k, v in unmapped.most_common())))
+
             with st.expander("ดู Job ในกลุ่ม 'อื่น ๆ' (ไม่ระบุสถานะ / CANCEL / POSTPONE ฯลฯ)"):
                 for nm, u in units:
                     oth = [{"Order": j["order"], "Equipment": j["eq"], "Description": j["desc"], "สถานะล่าสุด": j["last"] or "ไม่ระบุ",
